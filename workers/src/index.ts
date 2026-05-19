@@ -1,53 +1,41 @@
 // MostlyLearn — WhatsApp-Native Tutoring Ops OS
-// Cloudflare Workers single-script with route-based handlers
-// Routes: /api/whatsapp, /api/stripe, /api/calendly, /api/admin, /api/referral, /api/logs
+// Cloudflare Workers — Main entry point with router
 
 export interface Env {
-  ENVIRONMENT: string;
-  SHEET_ID: string;
+  ENVIRONMENT: 'development' | 'staging' | 'production';
+  TEST_MODE: string;
+
+  // Stripe
   STRIPE_WEBHOOK_SECRET: string;
+  STRIPE_API_KEY: string;
+  STRIPE_PRICE_ID: string;
+
+  // WhatsApp
   WHATSAPP_API_TOKEN: string;
   WHATSAPP_PHONE_NUMBER_ID: string;
+  WHATSAPP_VERIFY_TOKEN: string;
+
+  // Calendly
+  CALENDLY_API_TOKEN: string;
   CALENDLY_WEBHOOK_SECRET: string;
-  TEST_MODE: string;
+
+  // Google Sheets
+  SHEETS_ID: string;
+  SHEETS_SERVICE_ACCOUNT_JSON: string;
+
+  // Cloudflare
   PROCESSED_EVENTS: KVNamespace;
+  DEAD_LETTER_QUEUE: KVNamespace;
+  WRITE_QUEUE: KVNamespace;
+  SHEET_WRITE_QUEUE: Queue;
 }
 
-interface WebhookLog {
-  timestamp: string;
-  source: string;
-  event: string;
-  status: string;
-  details: string;
-}
-
-const LOGS: WebhookLog[] = [];
-
-function log(source: string, event: string, status: string, details: string) {
-  const entry: WebhookLog = {
-    timestamp: new Date().toISOString(),
-    source,
-    event,
-    status,
-    details,
-  };
-  LOGS.push(entry);
-  if (LOGS.length > 100) LOGS.shift();
-}
-
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type' },
-  });
-}
-
-function errorResponse(message: string, status = 400): Response {
-  return jsonResponse({ error: message }, status);
-}
+import { handleWhatsAppWebhook, handleWhatsAppVerify } from './whatsapp';
+import { handleStripeWebhook } from './stripe';
+import { handleCalendlyWebhook } from './calendly';
+import { handleReferral } from './referral';
+import { handleAdminRequest } from './admin';
+import { log, getRecentLogs } from './utils';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -55,141 +43,94 @@ export default {
     const path = url.pathname;
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
+      return corsResponse(null, 204);
     }
 
     try {
       switch (path) {
+        // Health
         case '/api/health':
-          return jsonResponse({ status: 'ok', env: env.ENVIRONMENT, testMode: env.TEST_MODE });
+          return jsonResponse({ status: 'ok', environment: env.ENVIRONMENT, testMode: env.TEST_MODE === 'true' });
 
+        // WhatsApp
         case '/api/whatsapp':
-          return handleWhatsApp(request, env);
+          if (request.method === 'GET') return handleWhatsAppVerify(request, env);
+          if (request.method === 'POST') return handleWhatsAppWebhook(request, env);
+          return methodNotAllowed();
 
+        // Stripe
         case '/api/stripe':
-          return handleStripe(request, env);
+          if (request.method !== 'POST') return methodNotAllowed();
+          return handleStripeWebhook(request, env);
 
+        // Calendly
         case '/api/calendly':
-          return handleCalendly(request, env);
+          if (request.method !== 'POST') return methodNotAllowed();
+          return handleCalendlyWebhook(request, env);
 
-        case '/api/admin':
-          return handleAdmin(request, env);
-
+        // Referral
         case '/api/referral':
+          if (request.method !== 'POST') return methodNotAllowed();
           return handleReferral(request, env);
 
+        // Admin
+        case '/api/admin':
+          if (request.method !== 'GET') return methodNotAllowed();
+          return handleAdminRequest(request, env);
+
+        // Logs
         case '/api/logs':
-          return jsonResponse(LOGS.slice(-50));
+          return jsonResponse(getRecentLogs());
 
         default:
-          return errorResponse('Not found', 404);
+          return jsonResponse({ error: 'Not found' }, 404);
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : 'Unknown error';
       log('system', path, 'error', msg);
-      return errorResponse('Internal error', 500);
+      return jsonResponse({ error: 'Internal server error' }, 500);
+    }
+  },
+
+  // Queue consumer for Sheet write operations (prevents race conditions)
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      try {
+        const payload = msg.body as { operation: string; data: unknown };
+        log('queue', payload.operation, 'processing', JSON.stringify(payload.data));
+        msg.ack();
+      } catch (err) {
+        log('queue', 'process', 'failed', err instanceof Error ? err.message : 'Unknown');
+        msg.retry({ delaySeconds: 5 });
+      }
     }
   },
 };
 
-// ─── WhatsApp Handler ────────────────────────────────────────
+// ─── Response helpers ───────────────────────────────────────
 
-async function handleWhatsApp(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') return errorResponse('Method not allowed', 405);
-
-  const body = await request.json() as Record<string, unknown>;
-
-  if (env.TEST_MODE === 'true') {
-    log('whatsapp', 'webhook_received', 'test', JSON.stringify(body));
-    return jsonResponse({ status: 'test_mode_ok' });
-  }
-
-  log('whatsapp', 'webhook_received', 'ok', 'Inbound message received');
-  return jsonResponse({ status: 'ok' });
-}
-
-// ─── Stripe Handler ─────────────────────────────────────────
-
-async function handleStripe(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') return errorResponse('Method not allowed', 405);
-
-  const signature = request.headers.get('stripe-signature');
-  if (!signature) return errorResponse('Missing Stripe signature', 401);
-
-  const body = await request.text();
-  const event = JSON.parse(body) as Record<string, unknown>;
-  const eventId = event.id as string;
-
-  if (env.TEST_MODE === 'true') {
-    log('stripe', 'webhook_received', 'test', eventId);
-    return jsonResponse({ status: 'test_mode_ok' });
-  }
-
-  const processed = await env.PROCESSED_EVENTS.get(eventId);
-  if (processed) {
-    log('stripe', event.type as string, 'duplicate', eventId);
-    return jsonResponse({ status: 'duplicate_ignored' });
-  }
-
-  await env.PROCESSED_EVENTS.put(eventId, JSON.stringify({
-    processedAt: new Date().toISOString(),
-    type: event.type,
-  }));
-
-  log('stripe', event.type as string, 'processed', eventId);
-  return jsonResponse({ status: 'ok' });
-}
-
-// ─── Calendly Handler ───────────────────────────────────────
-
-async function handleCalendly(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') return errorResponse('Method not allowed', 405);
-
-  const body = await request.json() as Record<string, unknown>;
-
-  if (env.TEST_MODE === 'true') {
-    log('calendly', 'webhook_received', 'test', JSON.stringify(body));
-    return jsonResponse({ status: 'test_mode_ok' });
-  }
-
-  log('calendly', 'booking_confirmed', 'ok', 'Demo scheduled');
-  return jsonResponse({ status: 'ok' });
-}
-
-// ─── Admin Handler ────────────────────────────────────────
-
-async function handleAdmin(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'GET') return errorResponse('Method not allowed', 405);
-
-  return jsonResponse({
-    environment: env.ENVIRONMENT,
-    testMode: env.TEST_MODE,
-    processedEventsCount: 0,
-    recentLogs: LOGS.slice(-10),
+export function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
   });
 }
 
-// ─── Referral Handler ──────────────────────────────────────
+export function corsResponse(data: unknown, status = 200): Response {
+  return new Response(data ? JSON.stringify(data) : null, {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, stripe-signature, x-webhook-signature',
+    },
+  });
+}
 
-async function handleReferral(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') return errorResponse('Method not allowed', 405);
-
-  const body = await request.json() as {
-    referral_code?: string;
-    referee_name?: string;
-    referee_phone?: string;
-  };
-
-  if (!body.referral_code || !body.referee_phone) {
-    return errorResponse('Missing referral_code or referee_phone');
-  }
-
-  log('referral', 'code_redeemed', 'ok', `${body.referral_code} → ${body.referee_phone}`);
-  return jsonResponse({ status: 'referral_logged' });
+export function methodNotAllowed(): Response {
+  return jsonResponse({ error: 'Method not allowed' }, 405);
 }
